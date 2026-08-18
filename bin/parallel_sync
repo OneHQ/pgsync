@@ -280,11 +280,17 @@ def multiprocess(
 ) -> None:
     sys.stdout.write("Multiprocess\n")
     task: Task = Task(doc, verbose=verbose, validate=validate)
-    with ProcessPoolExecutor(max_workers=ncpus) as executor:
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=ncpus,
+        mp_context=ctx,
+    ) as executor:
         try:
             list(executor.map(task.process, tasks))
         except Exception as e:
             sys.stdout.write(f"Exception: {e}\n")
+            raise
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
