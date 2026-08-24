@@ -2,6 +2,8 @@
 
 import importlib
 import os
+import subprocess
+import sys
 import typing as t
 from collections import namedtuple
 from types import SimpleNamespace
@@ -26,6 +28,121 @@ from pgsync.sync import settings, Sync
 from .testing_utils import override_env_var
 
 ROW = namedtuple("Row", ["data", "xid"])
+
+
+def make_root_sync(routing: str):
+    """Create the minimum Sync state needed to test root deletes."""
+    sync = object.__new__(Sync)
+    sync.index = "book"
+    sync.routing = routing
+    sync.tree = SimpleNamespace(
+        root=SimpleNamespace(
+            table="book",
+            model=SimpleNamespace(primary_keys=["id"]),
+        )
+    )
+    sync.get_doc_id = Mock(return_value="1")
+    sync.search_client = Mock()
+    sync.search_client.prepare_action.side_effect = lambda doc: doc
+    node = SimpleNamespace(
+        is_root=True,
+        table="book",
+        model=SimpleNamespace(primary_keys=["id"]),
+    )
+    return sync, node
+
+
+def test_cli_rejects_polling_and_wal_from_environment():
+    """Environment-derived polling and WAL defaults remain exclusive."""
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    env = {
+        **os.environ,
+        "POLLING": "true",
+        "WAL": "true",
+        "ELASTICSEARCH": "false",
+        "OPENSEARCH": "true",
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, [project_root, os.environ.get("PYTHONPATH")])
+        ),
+    }
+    result = subprocess.run(
+        [sys.executable, "bin/pgsync"],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "POLLING and WAL cannot both be enabled" in result.stderr
+
+
+def test_update_op_deletes_old_document_without_old_routing():
+    """A root primary-key update falls back to a cross-shard delete."""
+    sync, node = make_root_sync("book_isbn")
+    filters: dict = {"book": []}
+    payloads: t.List[Payload] = [
+        Payload(
+            tg_op="UPDATE",
+            table="book",
+            old={"id": 1},
+            new={"id": 2, "isbn": "001"},
+        )
+    ]
+
+    sync._update_op(node, filters, payloads)
+
+    sync.search_client.bulk.assert_not_called()
+    sync.search_client.delete_by_query.assert_called_once_with("book", ["1"])
+
+
+def test_update_op_deletes_old_document_with_old_routing():
+    """A direct delete is used when CDC includes the old routing value."""
+    sync, node = make_root_sync("id")
+    payloads: t.List[Payload] = [
+        Payload(
+            tg_op="UPDATE",
+            table="book",
+            old={"id": 1},
+            new={"id": 2},
+        )
+    ]
+
+    sync._update_op(node, {"book": []}, payloads)
+
+    delete = sync.search_client.bulk.call_args.args[1][0]
+    assert delete["_id"] == "1"
+    assert delete["_routing"] == 1
+    sync.search_client.delete_by_query.assert_not_called()
+
+
+def test_delete_op_deletes_document_without_old_routing():
+    """A root delete falls back to a cross-shard delete without routing."""
+    sync, node = make_root_sync("book_isbn")
+    payloads: t.List[Payload] = [
+        Payload(tg_op="DELETE", table="book", old={"id": 1})
+    ]
+
+    sync._delete_op(node, {"book": []}, payloads)
+
+    sync.search_client.bulk.assert_not_called()
+    sync.search_client.delete_by_query.assert_called_once_with("book", ["1"])
+
+
+def test_delete_op_deletes_document_with_old_routing():
+    """A root delete uses a direct routed delete when routing is available."""
+    sync, node = make_root_sync("id")
+    payloads: t.List[Payload] = [
+        Payload(tg_op="DELETE", table="book", old={"id": 1})
+    ]
+
+    sync._delete_op(node, {"book": []}, payloads)
+
+    delete = sync.search_client.bulk.call_args.args[1][0]
+    assert delete["_id"] == "1"
+    assert delete["_routing"] == 1
+    sync.search_client.delete_by_query.assert_not_called()
 
 
 @pytest.fixture(scope="function")
@@ -111,7 +228,7 @@ class TestSync(object):
                 [ROW("COMMIT 72736", 1234)],
                 [],
             ]
-            with patch("pgsync.sync.Sync.sync") as mock_sync:
+            with patch("pgsync.sync.Sync.sync"):
                 sync.logical_slot_changes()
                 assert mock_peek.call_args_list == [
                     call(
@@ -305,7 +422,7 @@ class TestSync(object):
                 ],
                 [],
             ]
-            with patch("pgsync.sync.Sync.sync") as mock_sync:
+            with patch("pgsync.sync.Sync.sync"):
                 sync.logical_slot_changes()
                 assert mock_logical_slot_peek_changes.call_args_list == [
                     call(
@@ -1921,7 +2038,7 @@ class TestSync(object):
         mock_payloads.return_value = iter(
             [{"_id": "1", "_index": "testdb", "_source": {"field": "value"}}]
         )
-        docs = list(sync.sync())
+        list(sync.sync())
         # Should yield documents
 
     def test_nodes_property(self, sync):
@@ -1980,7 +2097,7 @@ class TestSync(object):
         payloads = [
             Payload(tg_op="TRUNCATE", table="book", schema="public"),
         ]
-        result = list(sync._payloads(payloads))
+        list(sync._payloads(payloads))
         # TRUNCATE triggers sync without filters
 
     def test_tree_tables_property(self, sync):
@@ -2373,7 +2490,7 @@ class TestWALStreaming:
         with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
             with patch.object(threading.Thread, "start", _record_start):
                 runner = CliRunner()
-                result = runner.invoke(main, ["--wal", "-c", tmp.name])
+                runner.invoke(main, ["--wal", "-c", tmp.name])
 
         # All three consumers should have been called
         for s in sync_instances:
@@ -2413,7 +2530,7 @@ class TestWALStreaming:
         with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
             with patch.object(threading.Thread, "start", _record_start):
                 runner = CliRunner()
-                result = runner.invoke(main, ["--wal", "-c", tmp.name])
+                runner.invoke(main, ["--wal", "-c", tmp.name])
 
         sync_instance.wal_consumer.assert_called_once()
         assert len(started_threads) == 0
@@ -2777,9 +2894,7 @@ class TestAsyncMethods:
                 assert status_called.wait(
                     timeout=2.0
                 ), "_status was not called"
-                assert meta_called.wait(
-                    timeout=2.0
-                ), "set_meta was not called"
+                assert meta_called.wait(timeout=2.0), "set_meta was not called"
 
 
 # ============================================================================
@@ -2976,7 +3091,7 @@ class TestSyncEdgeCases:
         filters = {"book": []}
 
         with patch.object(sync.search_client, "_search", return_value=["001"]):
-            with patch.object(sync.search_client, "bulk") as mock_bulk:
+            with patch.object(sync.search_client, "bulk"):
                 result = sync._delete_op(node, filters, payloads)
 
                 # Should have searched and deleted
@@ -3035,7 +3150,7 @@ class TestSyncEdgeCases:
                 [(["001"], {"isbn": "001"}, ["001"])]
             )
 
-            docs = list(sync.sync())
+            list(sync.sync())
 
             # Plugin should be called
             mock_plugin.transform.assert_called()
@@ -3246,7 +3361,6 @@ class TestMySQLCheckpointExtended:
 
     def test_checkpoint_setter_creates_directory(self):
         """Test checkpoint setter creates parent directory if needed."""
-        import tempfile
         from pathlib import Path
 
         with override_env_var(REDIS_CHECKPOINT="False", ELASTICSEARCH="True"):

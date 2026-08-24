@@ -1,6 +1,7 @@
 """SearchClient tests."""
 
 import importlib
+from types import SimpleNamespace
 
 import elastic_transport
 import mock
@@ -15,6 +16,19 @@ from .testing_utils import override_env_var
 
 class TestSearchClient(object):
     """Search Client tests."""
+
+    def test_delete_by_query(self):
+        """Delete-by-query targets every shard when routing is unavailable."""
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+
+        client.delete_by_query("book", ["1", "2"])
+
+        client._SearchClient__client.delete_by_query.assert_called_once_with(
+            index="book",
+            body={"query": {"ids": {"values": ["1", "2"]}}},
+            conflicts="proceed",
+        )
 
     def test_get_search_init(self, mocker):
         url = "http://some-domain:33"
@@ -463,9 +477,7 @@ class TestSearchClient(object):
                     mock_tree.traverse_post_order.return_value = [mock_node]
                     mock_tree.root = mock_node
 
-                    result = client._build_mapping(
-                        mock_tree, routing="user_id"
-                    )
+                    client._build_mapping(mock_tree, routing="user_id")
 
                     assert mock_node._mapping.get("_routing") == {
                         "required": True
@@ -646,3 +658,152 @@ class TestSearchClientBulkOperations:
                     ):
                         # Should not raise when settings are False
                         client.bulk("test", actions)
+
+
+class TestSearchClientErrorPaths:
+    """Unit tests for branches that do not need a running search service."""
+
+    def test_elasticsearch_info_error_keeps_default_version(self):
+        with override_env_var(ELASTICSEARCH="True", OPENSEARCH="False"):
+            importlib.reload(settings)
+            backend = MagicMock()
+            backend.info.return_value = {"version": {}}
+            with mock.patch(
+                "pgsync.search_client.get_search_url",
+                return_value="http://localhost:9200",
+            ):
+                with mock.patch(
+                    "pgsync.search_client.get_search_client",
+                    return_value=backend,
+                ):
+                    assert SearchClient().major_version == 0
+
+    def test_prepare_action_only_adds_type_for_legacy_elasticsearch(self):
+        client = object.__new__(SearchClient)
+        client.major_version = 6
+        client.is_opensearch = False
+        assert client.prepare_action({"id": 1}) == {"id": 1, "_type": "_doc"}
+
+        client.major_version = 8
+        assert client.prepare_action({"id": 1}) == {"id": 1}
+
+    @mock.patch("pgsync.search_client.logger")
+    def test_teardown_logs_and_reraises_client_errors(self, mock_logger):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+        client._SearchClient__client.indices.delete.side_effect = RuntimeError(
+            "unavailable"
+        )
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            client.teardown("books")
+
+        mock_logger.exception.assert_called_once()
+
+    def test_delete_by_query_skips_empty_ids(self):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+
+        client.delete_by_query("books", [])
+
+        client._SearchClient__client.delete_by_query.assert_not_called()
+
+    @mock.patch("pgsync.search_client.logger")
+    def test_search_ignores_known_numeric_range_error(self, mock_logger):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+        search = MagicMock()
+        search.source.return_value = search
+        search.scan.side_effect = elasticsearch.exceptions.RequestError(
+            400, "bad request", {"error": "is out of range for a long"}
+        )
+        client.Search = MagicMock(return_value=search)
+        client.Bool = MagicMock()
+        client.Q = MagicMock()
+
+        assert list(client._search("books", "book")) == []
+        mock_logger.warning.assert_called_once()
+
+    def test_search_reraises_unrecognized_request_error(self):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+        search = MagicMock()
+        search.source.return_value = search
+        search.scan.side_effect = elasticsearch.exceptions.RequestError(
+            400, "bad request", {"error": "invalid query"}
+        )
+        client.Search = MagicMock(return_value=search)
+        client.Bool = MagicMock()
+        client.Q = MagicMock()
+
+        with pytest.raises(elasticsearch.exceptions.RequestError):
+            list(client._search("books", "book"))
+
+    def test_create_setting_supports_explicit_mappings(self):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+        indices = client._SearchClient__client.indices
+        indices.exists.return_value = False
+
+        client._create_setting(
+            "books",
+            MagicMock(),
+            mappings={"dynamic": "strict"},
+            mapping={"dynamic_templates": [{"strings": {}}]},
+        )
+
+        indices.create.assert_called_once_with(
+            index="books",
+            body={
+                "mappings": {"dynamic_templates": [{"strings": {}}]},
+            },
+        )
+
+    def test_create_setting_reraises_create_error(self):
+        client = object.__new__(SearchClient)
+        client._SearchClient__client = MagicMock()
+        client._SearchClient__client.indices.exists.return_value = False
+        client._SearchClient__client.indices.create.side_effect = RuntimeError(
+            "unavailable"
+        )
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            client._create_setting("books", MagicMock(), mapping={"title": {}})
+
+    def test_build_mapping_adds_parameters_to_legacy_nested_mapping(self):
+        client = object.__new__(SearchClient)
+        client.major_version = 6
+        client.is_opensearch = False
+        parent = SimpleNamespace(
+            transform={}, _mapping={}, parent=None, label="books"
+        )
+        child = SimpleNamespace(
+            transform={
+                "rename": {"title": "name"},
+                "mapping": {"name": {"type": "text", "analyzer": "standard"}},
+            },
+            _mapping={},
+            parent=parent,
+            label="author",
+        )
+        tree = SimpleNamespace(
+            root=parent,
+            traverse_post_order=lambda: [child, parent],
+        )
+
+        assert client._build_mapping(tree) == {
+            "mappings": {
+                "_doc": {
+                    "properties": {
+                        "author": {
+                            "properties": {
+                                "name": {
+                                    "type": "text",
+                                    "analyzer": "standard",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
