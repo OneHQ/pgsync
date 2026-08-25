@@ -193,15 +193,23 @@ class Sync(Base, metaclass=Singleton):
         if self.index is None:
             raise ValueError("Index is missing for doc")
 
-        # replication slot not needed in polling or mysql
-        if not self.is_mysql_compat and not polling:
+        # Logical replication is owned exclusively by the producer.
+        # Consumers still need PostgreSQL for queries/document reconstruction,
+        # but they must not require replication-slot privileges.
+        if self.producer and not self.is_mysql_compat and not polling:
             max_replication_slots: t.Optional[str] = self.pg_settings(
                 "max_replication_slots"
             )
+
             try:
-                if int(max_replication_slots) < 1:
-                    raise TypeError
-            except TypeError:
+                max_slots = int(max_replication_slots)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Invalid max_replication_slots value. "
+                    "Ensure max_replication_slots is configured with a value >= 1."
+                )
+
+            if max_slots < 1:
                 raise RuntimeError(
                     "Ensure there is at least one replication slot defined "
                     "by setting max_replication_slots = 1"
@@ -231,6 +239,7 @@ class Sync(Base, metaclass=Singleton):
                     f'Make sure you have run the "bootstrap" command.'
                 )
 
+        # Redis validation remains required for both producer and consumer.
         if settings.REDIS_CHECKPOINT:
             # ensure Redis is reachable
             try:
@@ -2153,24 +2162,39 @@ class Sync(Base, metaclass=Singleton):
         3. Consume all changes from Redis/Valkey.
         """
         if settings.USE_ASYNC:
-            self._conn = self.engine.connect().connection
-            self._conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-            cursor = self.conn.cursor()
-            cursor.execute(f'LISTEN "{self.database}"')
             event_loop = asyncio.get_event_loop()
-            event_loop.add_reader(self.conn, self.async_poll_db)
-            self.tasks: t.List[asyncio.Task] = [
-                event_loop.create_task(self.async_poll_redis()),
-                event_loop.create_task(self.async_truncate_slots()),
-                event_loop.create_task(self.async_status()),
-            ]
+            self.tasks = []
+
+            if self.producer:
+                self._conn = self.engine.connect().connection
+                self._conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+                cursor = self.conn.cursor()
+                cursor.execute(f'LISTEN "{self.database}"')
+                event_loop.add_reader(self.conn, self.async_poll_db)
+
+                # Catch up to the current transaction ID.
+                self.pull()
+
+                # Only the producer owns replication-slot cleanup.
+                self.tasks.append(event_loop.create_task(self.async_truncate_slots()))
+
+            if self.consumer:
+                self.tasks.append(event_loop.create_task(self.async_poll_redis()))
+
+            self.tasks.append(event_loop.create_task(self.async_status()))
 
         else:
             # sync up to and produce items in the Redis/Valkey cache
             if self.producer:
                 self._workers.append(self.poll_db())
+
                 # sync up to current transaction_id
+                # Catch up while poll_db buffers concurrent DB notifications.
                 self.pull()
+
+                # start a background worker thread to cleanup the replication slot
+                # Replication-slot ownership belongs exclusively to the producer.
+                self._workers.append(self.truncate_slots())
 
             # start a background worker consumer thread to
             # poll Redis/Valkey and populate Elasticsearch/OpenSearch
@@ -2178,8 +2202,6 @@ class Sync(Base, metaclass=Singleton):
                 for _ in range(self.num_workers):
                     self._workers.append(self.poll_redis())
 
-            # start a background worker thread to cleanup the replication slot
-            self._workers.append(self.truncate_slots())
             # start a background worker thread to show status
             self._workers.append(self.status())
 
@@ -2411,6 +2433,9 @@ def main(
     else:
         consumer = producer = True
 
+    if consumer and not producer and not daemon:
+        raise click.UsageError("--consumer requires --daemon")
+
     with Timer():
         if analyze:
             for doc in config_loader(
@@ -2486,10 +2511,12 @@ def main(
                     bootstrap=bootstrap,
                     **kwargs,
                 )
-                sync.pull()
+
                 if daemon:
                     sync.receive()
                     tasks.extend(sync.tasks)
+                else:
+                    sync.pull()
 
             if settings.USE_ASYNC:
                 event_loop: asyncio.AbstractEventLoop = (
